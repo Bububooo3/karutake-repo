@@ -11,6 +11,7 @@ const KARUTA_ID = '646937666251915264'; // verify: Developer Mode > right-click 
 const KARIBBIT_ID = '1274445226064220273';
 
 const { DropTracker, badgeLabels } = require('./drop-tracker');
+const { createCombat } = require('./battle-discord');
 const STEAL_AFTER_SECONDS = Number(process.env.STEAL_AFTER_SECONDS ?? 60);
 if (!Number.isInteger(STEAL_AFTER_SECONDS) || STEAL_AFTER_SECONDS < 5 || STEAL_AFTER_SECONDS > 3600) {
   throw new Error('STEAL_AFTER_SECONDS must be a whole number between 5 and 3600.');
@@ -111,6 +112,8 @@ function save() {
   fs.renameSync(tmp, DATA_FILE);
 }
 
+const combat = createCombat({ data, save });
+
 let lastTick = Date.now();
 function tick() {
   const now = Date.now();
@@ -118,13 +121,38 @@ function tick() {
   if (dt < 120_000) data.uptimeMs += dt; // ignore big gaps (e.g. laptop asleep)
   lastTick = now;
 }
-setInterval(() => { tick(); save(); }, 30_000);
+setInterval(() => { combat.engine.expire(); tick(); save(); void flushRealmNotices(); }, 30_000);
 
 function shutdown() { tick(); save(); process.exit(0); }
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 // ==== DROP TRACKING ====
+let sendingRealmNotices = false;
+async function flushRealmNotices() {
+  if (sendingRealmNotices || !client.isReady?.()) return;
+  sendingRealmNotices = true;
+  try {
+    for (const notice of [...combat.engine.state.notices].slice(0, 25)) {
+      try {
+        const channel = await client.channels.fetch(notice.channelId);
+        const title = notice.type === 'legend' ? 'A new Realm Legend has taken the stage!' :
+          notice.cards.length > 1 ? 'New strongest cards have entered the realm!' : 'A new strongest card has entered the realm!';
+        const lines = notice.cards.slice(0, 8).map((c) => `**${esc(c.name.slice(0, 100))}** · \`${c.id}\`\nHP ${c.health} · ATK ${c.attack} · DEF ${c.defense} · Power ${c.power}`);
+        const embed = new EmbedBuilder().setColor(notice.type === 'legend' ? 0xf0b949 : 0xb26bf5).setTitle(title)
+          .setDescription(lines.join('\n\n') + (notice.cards.length > 8 ? `\n…and ${notice.cards.length - 8} equally strong arrivals.` : '') + '\n\nDare to face them with `/challenge`.')
+          .setFooter({ text: 'Arrival stats · combat power = HP + ATK + DEF' });
+        await channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
+        const index = combat.engine.state.notices.findIndex((n) => n.id === notice.id);
+        if (index >= 0) combat.engine.state.notices.splice(index, 1);
+        save();
+      } catch (error) {
+        console.error(`Realm announcement ${notice.id} failed; will retry:`, error.message);
+      }
+    }
+  } finally { sendingRealmNotices = false; }
+}
+
 const requiredPermissions = [
   PermissionsBitField.Flags.ViewChannel,
   PermissionsBitField.Flags.ReadMessageHistory,
@@ -190,7 +218,10 @@ const tracker = new DropTracker({
   record: (drop, cards) => {
     const base = { at: Date.now(), guildId: drop.guildId, channelId: drop.channelId,
       dropperId: drop.dropperId, dropId: drop.id };
-    for (const card of cards) data.stolen.push({ ...base, ...card });
+    const arrivals = cards.map((card) => ({ ...base, ...card }));
+    data.stolen.push(...arrivals);
+    combat.engine.syncCards();
+    combat.engine.queueArrivalNotices(drop, arrivals);
     save();
   },
   announce: async (drop, cards) => {
@@ -206,6 +237,7 @@ const tracker = new DropTracker({
       } else content += separator + name;
     }
     await channel.send({ content, allowedMentions: { parse: [] } });
+    await flushRealmNotices();
     // Keep metadata available through both claim checks and the announcement.
     for (const id of drop.karibbitMessageIds ?? []) {
       await channel.messages.delete(id).catch((error) => {
@@ -283,7 +315,7 @@ async function setReactions(msg, list) {
 const commands = [
   new SlashCommandBuilder()
     .setName('get')
-    .setDescription('Browse the cards that were stolen')
+    .setDescription('Browse theft history; use /realm for unclaimed copies and /collection for owned cards')
     .addStringOption((o) => o
       .setName('sort-mode')
       .setDescription('How to sort (default: date)')
@@ -294,7 +326,7 @@ const commands = [
         { name: 'Date stolen', value: 'date' },
       )),
   new SlashCommandBuilder().setName('stats').setDescription('Show theft stats'),
-].map((c) => c.toJSON());
+].map((c) => c.toJSON()).concat(combat.commands);
 
 async function handleGet(i) {
   const sort = i.options.getString('sort-mode') ?? 'date';
@@ -405,10 +437,12 @@ client.once('ready', async () => {
   console.log(`Online as ${client.user.tag}`);
   console.log(`[Karutake] Started at=${new Date().toISOString()} pid=${process.pid} wait=${STEAL_AFTER_SECONDS}s channels=${[...CHANNEL_IDS].join(',') || 'all visible'} debug=${DEBUG}`);
   for (const g of client.guilds.cache.values()) await registerCommands(g);
+  await flushRealmNotices();
 });
 client.on('guildCreate', registerCommands);
 
 client.on('interactionCreate', async (i) => {
+  if (await combat.handle(i)) return;
   if (!i.isChatInputCommand() || !i.inGuild()) return;
   try {
     if (i.commandName === 'get') await handleGet(i);

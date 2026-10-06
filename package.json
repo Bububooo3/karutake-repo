@@ -1,13 +1,13 @@
 {
   "name": "karutake",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
   "description": "Karutake Discord companion",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "check": "node --check index.js && node --check drop-tracker.js",
-    "test": "node --test drop-tracker.test.js index.test.js"
+    "check": "node --check index.js && node --check drop-tracker.js && node --check battle-engine.js && node --check battle-discord.js",
+    "test": "node --test drop-tracker.test.js index.test.js battle-engine.test.js battle-discord.test.js"
   },
   "engines": {
     "node": ">=18.20.8"
